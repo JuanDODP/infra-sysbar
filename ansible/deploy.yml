@@ -1,0 +1,108 @@
+---
+- name: Preparar servidor EC2 para SysRanchito
+  hosts: webservers
+  become: true
+  vars_files:
+    - vars.yml
+
+  tasks:
+    - name: Actualizar repositorios e instalar paquetes base
+      apt:
+        update_cache: yes
+        name:
+          - curl
+          - git
+          - ufw
+          - fail2ban
+          - nginx
+          - certbot
+          - python3-certbot-nginx
+        state: present
+
+    # --- 1. INSTALACIÓN DE DOCKER & DOCKER COMPOSE ---
+    - name: Descargar script oficial de Docker
+      get_url:
+        url: https://get.docker.com
+        dest: /tmp/get-docker.sh
+        mode: '0755'
+
+    - name: Ejecutar script de instalación de Docker
+      command: sh /tmp/get-docker.sh
+      args:
+        creates: /usr/bin/docker
+
+    - name: Agregar usuario ubuntu al grupo docker
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    # --- 2. CONFIGURACIÓN DE SEGURIDAD (FAIL2BAN & FIREWALL) ---
+    - name: Configurar jaula básica de Fail2ban para SSH
+      copy:
+        dest: /etc/fail2ban/jail.local
+        content: |
+          [DEFAULT]
+          bantime  = 1h
+          findtime = 10m
+          maxretry = 5
+
+          [sshd]
+          enabled = true
+          port    = ssh
+
+    - name: Reiniciar servicio Fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
+        enabled: yes
+
+    - name: Configurar reglas de UFW (Firewall)
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - '22'   # SSH
+        - '80'   # HTTP
+        - '443'  # HTTPS
+
+    - name: Habilitar UFW
+      ufw:
+        state: enabled
+
+    # --- 3. PREPARAR DIRECTORIOS ---
+    - name: Asegurar que el directorio /var/www tenga permisos para ubuntu
+      file:
+        path: "{{ app_directory }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: '0755'
+
+    # --- 4. CONFIGURAR NGINX CON PLANTILLA JINJA2 ---
+    - name: Crear configuración de Nginx desde plantilla jinja2
+      template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/sites-available/sysranchito.conf
+
+    - name: Habilitar sitio en Nginx
+      file:
+        src: /etc/nginx/sites-available/sysranchito.conf
+        dest: /etc/nginx/sites-enabled/sysranchito.conf
+        state: link
+
+    - name: Remover sitio default de Nginx
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Probar sintaxis de Nginx y recargar
+      command: nginx -t
+      notify: Recargar Nginx
+
+  handlers:
+    - name: Recargar Nginx
+      systemd:
+        name: nginx
+        state: reloaded

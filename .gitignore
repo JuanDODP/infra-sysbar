@@ -1,0 +1,44 @@
+# ==========================================
+# TERRAFORM (Archivos de estado y secretos)
+# ==========================================
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+*.tfvars.json
+*.tfplan
+*.plan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# ==========================================
+# ANSIBLE (Inventario sensible y temporales)
+# ==========================================
+*.retry
+ansible/inventory.ini
+ansible/vars.yml
+roles/
+
+# ==========================================
+# VARIABLES DE ENTORNO Y LLAVES
+# ==========================================
+.env
+.env.*
+*.pem
+*.key
+
+# ==========================================
+# SISTEMA OPERATIVO Y IDEs
+# ==========================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
