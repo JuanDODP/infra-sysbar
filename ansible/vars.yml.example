@@ -1,0 +1,4 @@
+app_directory: "/var/www"
+domain_name: "tu-dominio.duckdns.org"
+app_port: 3000
+certbot_email: "tu_correo@ejemplo.com"

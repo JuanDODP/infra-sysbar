@@ -80,7 +80,7 @@
         group: ubuntu
         mode: '0755'
 
-    # --- 4. CONFIGURAR NGINX CON PLANTILLA JINJA2 ---
+    # --- 4. CONFIGURAR NGINX ---
     - name: Crear configuración de Nginx desde plantilla jinja2
       template:
         src: nginx.conf.j2
@@ -100,6 +100,17 @@
     - name: Probar sintaxis de Nginx y recargar
       command: nginx -t
       notify: Recargar Nginx
+
+    # --- 5. OBTENER Y CONFIGURAR CERTIFICADO SSL CON CERTBOT ---
+    - name: Obtener e instalar certificado SSL de Let's Encrypt
+      command: >
+        certbot --nginx -d {{ domain_name }}
+        --non-interactive
+        --agree-tos
+        -m {{ certbot_email }}
+        --redirect
+      args:
+        creates: "/etc/letsencrypt/live/{{ domain_name }}/fullchain.pem"
 
   handlers:
     - name: Recargar Nginx
