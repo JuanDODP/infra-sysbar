@@ -1,0 +1,10 @@
+# Configuración General de AWS
+aws_region  = "us-east-2"
+project     = "sysranchito"
+environment = "dev"
+key_name    = "YOUR_SSH_KEY_NAME" # Ej: tu-llave-ssh (sin extensión .pem)
+
+# Variables para la Base de Datos (AWS RDS PostgreSQL)
+db_name     = "sysranchitodb"
+db_user     = "postgres"
+db_password = "CHANGE_ME_SECURE_PASSWORD" # Cambiar por una contraseña segura
