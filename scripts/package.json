@@ -1,0 +1,12 @@
+{
+  "name": "infra-sysbar-scripts",
+  "private": true,
+  "description": "Scripts de verificación de la infraestructura",
+  "type": "module",
+  "scripts": {
+    "test:ws": "node test-websockets.mjs"
+  },
+  "dependencies": {
+    "socket.io-client": "^4.8.4"
+  }
+}
