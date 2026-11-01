@@ -42,3 +42,14 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+# ==========================================
+# MULTI-SERVIDOR (generados localmente)
+# ==========================================
+# Certificado y llave privada de Let's Encrypt (ansible/certificado.yml)
+certs/
+# Variables generadas por Terraform (incluyen la contraseña de la BD)
+ansible/group_vars/all/infra.yml
+
+# Dependencias del script de prueba de WebSockets
+scripts/node_modules/
+scripts/package-lock.json
