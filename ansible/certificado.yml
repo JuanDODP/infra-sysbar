@@ -1,0 +1,103 @@
+---
+# PASO 1 (antes de Terraform) y cada renovación (~cada 60 días).
+# Obtiene un certificado de Let's Encrypt para el dominio de DuckDNS usando el
+# reto DNS-01 (registro TXT vía la API de DuckDNS) y lo deja en ../certs/
+# para que Terraform lo importe a ACM.
+#
+# Uso:   ansible-playbook certificado.yml
+# Forzar renovación:   ansible-playbook certificado.yml -e acme_force=true
+
+- name: Obtener/renovar certificado TLS con acme.sh + DuckDNS
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars.yml
+
+  vars:
+    acme_root: "{{ lookup('env', 'HOME') }}/.acme-sysbar"
+    acme_src: "{{ acme_root }}/acme.sh"
+    acme_data: "{{ acme_root }}/data"
+    certs_dir: "{{ playbook_dir }}/../certs"
+    acme_force: false
+    acme_common_args: >-
+      --home {{ acme_src }}
+      --config-home {{ acme_data }}
+      --server letsencrypt
+
+  tasks:
+    - name: Validar variables
+      assert:
+        that:
+          - duckdns_token is defined
+          - duckdns_token | length > 0
+          - duckdns_token != 'TU_TOKEN_DE_DUCKDNS'
+          - domain_name is search('duckdns\\.org$')
+        fail_msg: "Configura duckdns_token y domain_name en ansible/vars.yml"
+
+    - name: Descargar acme.sh (solo la primera vez)
+      git:
+        repo: https://github.com/acmesh-official/acme.sh.git
+        dest: "{{ acme_src }}"
+        version: master
+        depth: 1
+        update: false
+
+    - name: Crear carpetas de datos y certificados
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: "0700"
+      loop:
+        - "{{ acme_data }}"
+        - "{{ certs_dir }}"
+
+    - name: Registrar cuenta en Let's Encrypt
+      command: >-
+        {{ acme_src }}/acme.sh --register-account -m {{ acme_email }}
+        {{ acme_common_args }}
+      changed_when: false
+
+    - name: Emitir certificado (DNS-01 con DuckDNS, tarda ~2 minutos)
+      command: >-
+        {{ acme_src }}/acme.sh --issue
+        --dns dns_duckdns
+        -d {{ domain_name }}
+        --keylength 2048
+        --dnssleep 120
+        {{ acme_common_args }}
+        {{ '--force' if acme_force | bool else '' }}
+      environment:
+        DuckDNS_Token: "{{ duckdns_token }}"
+      register: acme_issue
+      # rc=2 significa "aún no toca renovar": no es error
+      changed_when: acme_issue.rc == 0
+      failed_when: acme_issue.rc not in [0, 2]
+
+    - name: Copiar certificado a ../certs para Terraform
+      command: >-
+        {{ acme_src }}/acme.sh --install-cert
+        -d {{ domain_name }}
+        --home {{ acme_src }}
+        --config-home {{ acme_data }}
+        --cert-file {{ certs_dir }}/cert.pem
+        --key-file {{ certs_dir }}/privkey.pem
+        --ca-file {{ certs_dir }}/chain.pem
+        --fullchain-file {{ certs_dir }}/fullchain.pem
+      changed_when: acme_issue.rc == 0
+
+    - name: Proteger la llave privada
+      file:
+        path: "{{ certs_dir }}/privkey.pem"
+        mode: "0600"
+
+    - name: Leer fecha de expiración
+      command: openssl x509 -enddate -noout -in {{ certs_dir }}/cert.pem
+      register: cert_end
+      changed_when: false
+
+    - name: Siguiente paso
+      debug:
+        msg:
+          - "Certificado listo en certs/ ({{ cert_end.stdout }})"
+          - "Ahora ejecuta desde la raíz del proyecto: terraform apply"
