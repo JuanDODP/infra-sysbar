@@ -1,4 +1,28 @@
+# Copia este archivo a vars.yml y completa los valores. vars.yml NO se sube al repo.
+# Las IPs, endpoints de RDS/Redis y credenciales de la BD llegan solos desde
+# Terraform en group_vars/all/infra.yml.
+
+# --- Dominio y certificado (DuckDNS + Let's Encrypt) ---
+domain_name: "tu-subdominio.duckdns.org"     # Debe ser igual al de terraform.tfvars
+duckdns_subdomain: "tu-subdominio"           # Solo la parte antes de .duckdns.org
+duckdns_token: "TU_TOKEN_DE_DUCKDNS"         # duckdns.org, arriba: "token" (en español aparece como "simbólico")
+acme_email: "tu_correo@ejemplo.com"         # Avisos de Let's Encrypt
+
+# --- Servidores ---
 app_directory: "/var/www"
-domain_name: "tu-dominio.duckdns.org"
-app_port: 3000
-certbot_email: "tu_correo@ejemplo.com"
+app_port: 3000                               # Puerto donde escucha NestJS dentro de cada EC2
+nginx_client_max_body_size: "10m"
+
+# --- Despliegue de la aplicación (opcional) ---
+# Si app_repo_url está vacío, deploy.yml solo prepara los servidores.
+app_name: "mi-api"                           # Carpeta donde se clona la app en cada EC2
+app_repo_url: ""                             # Ej: git@github.com:TU_USUARIO/TU_API.git  (vacío = no desplegar app)
+app_repo_version: "main"                     # Rama a desplegar
+app_compose_file: "docker-compose.prod.yml"  # Compose de producción dentro del repo de la app
+app_service: "api"                           # Servicio del compose donde corre la API
+app_migration_command: ""                    # Ej: "npm run migration:run" (se ejecuta en UN solo servidor)
+
+# Variables extra para el .env de la app (se suman a las de BD y Redis)
+app_extra_env:
+  NODE_ENV: "production"
+  JWT_SECRET: "CAMBIA_ESTO"   # openssl rand -hex 32
