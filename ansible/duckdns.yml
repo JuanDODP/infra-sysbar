@@ -1,0 +1,40 @@
+---
+# PASO 3 (después de terraform apply).
+# Apunta tu dominio de DuckDNS a la IP elástica del NLB y espera a que el DNS propague.
+#
+# Uso:   ansible-playbook duckdns.yml
+
+- name: Actualizar DuckDNS con la IP elástica del NLB
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - vars.yml
+
+  tasks:
+    - name: Validar que Terraform ya generó la IP
+      assert:
+        that:
+          - nlb_public_ip is defined
+          - nlb_public_ip | length > 0
+        fail_msg: "No existe group_vars/all/infra.yml. Ejecuta primero terraform apply."
+
+    - name: Actualizar registro A en DuckDNS
+      uri:
+        url: "https://www.duckdns.org/update?domains={{ duckdns_subdomain }}&token={{ duckdns_token }}&ip={{ nlb_public_ip }}"
+        return_content: true
+      register: duckdns
+      failed_when: duckdns.content | trim != 'OK'
+      no_log: true # la URL contiene el token
+
+    - name: Esperar a que {{ domain_name }} resuelva a {{ nlb_public_ip }}
+      command: dig +short {{ domain_name }} @1.1.1.1
+      register: dns
+      until: nlb_public_ip in dns.stdout_lines
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Listo
+      debug:
+        msg: "{{ domain_name }} -> {{ nlb_public_ip }}. Siguiente paso: ansible-playbook deploy.yml"
