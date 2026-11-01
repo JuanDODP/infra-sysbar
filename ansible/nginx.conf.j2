@@ -1,16 +1,71 @@
+# Generado por Ansible. Nginx en cada EC2, detrás de NLB -> ALB.
+# El ALB termina TLS; aquí solo llega HTTP en el puerto 80.
+
+# Upgrade de WebSockets: si el cliente pide "Upgrade", se reenvía; si no,
+# se deja la conexión keep-alive hacia NestJS.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
+# El ALB envía X-Forwarded-Proto=https; si alguien entra directo, se usa $scheme
+map $http_x_forwarded_proto $sysbar_forwarded_proto {
+    default $http_x_forwarded_proto;
+    ''      $scheme;
+}
+
+# Conserva el X-Forwarded-For del ALB; si no viene, usa la IP de quien conecta
+map $http_x_forwarded_for $sysbar_forwarded_for {
+    default $http_x_forwarded_for;
+    ''      $remote_addr;
+}
+
+upstream sysbar_app {
+    server 127.0.0.1:{{ app_port }};
+    keepalive 32;
+}
+
 server {
-    listen 80;
-    server_name {{ domain_name }};
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    # default_server: responde también a los health checks del ALB (llegan con la IP como Host)
+    server_name {{ domain_name }} _;
+
+    client_max_body_size {{ nginx_client_max_body_size | default('10m') }};
+
+    # IP real del cliente (el NLB la conserva y el ALB la pone en X-Forwarded-For)
+    set_real_ip_from {{ vpc_cidr }};
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+
+    # Health check de Nginx (no depende de la app)
+    location = /nginx-health {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
 
     location / {
-        proxy_pass http://127.0.0.1:{{ app_port }};
+        proxy_pass http://sysbar_app;
         proxy_http_version 1.1;
+
+        # WebSockets (Socket.IO / ws)
         proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
+        proxy_set_header Connection $connection_upgrade;
         proxy_cache_bypass $http_upgrade;
+
+        proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-For $sysbar_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $sysbar_forwarded_proto;
+        proxy_set_header X-Forwarded-Port $http_x_forwarded_port;
+
+        # Conexiones WebSocket largas: igual que el idle timeout de NLB/ALB
+        proxy_connect_timeout 10s;
+        proxy_send_timeout {{ lb_idle_timeout | default(3600) }}s;
+        proxy_read_timeout {{ lb_idle_timeout | default(3600) }}s;
+
+        # No bufferizar respuestas en streaming (SSE / long-polling)
+        proxy_buffering off;
     }
 }
