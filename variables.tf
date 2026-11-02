@@ -33,15 +33,64 @@ variable "domain_name" {
 # ==========================================
 # EC2 (servidores de la aplicación)
 # ==========================================
-variable "instance_count" {
-  description = "Número de instancias EC2 detrás del balanceador"
+# ==========================================
+# AUTO SCALING GROUP (cuántos servidores y cuándo crecer)
+# ==========================================
+variable "asg_min_size" {
+  description = "Mínimo de instancias: nunca habrá menos (cuando el tráfico baja al mínimo)"
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.asg_min_size >= 1
+    error_message = "asg_min_size debe ser al menos 1."
+  }
+}
+
+variable "asg_desired_capacity" {
+  description = "Instancias recomendadas al crear el grupo. Después las ajustan las políticas de escalado"
   type        = number
   default     = 3
 
   validation {
-    condition     = var.instance_count >= 1 && var.instance_count <= 10
-    error_message = "instance_count debe estar entre 1 y 10."
+    condition     = var.asg_desired_capacity >= var.asg_min_size && var.asg_desired_capacity <= var.asg_max_size
+    error_message = "asg_desired_capacity debe estar entre asg_min_size y asg_max_size."
   }
+}
+
+variable "asg_max_size" {
+  description = "Máximo de instancias cuando el tráfico es máximo"
+  type        = number
+  default     = 10
+
+  validation {
+    condition     = var.asg_max_size >= var.asg_min_size && var.asg_max_size <= 20
+    error_message = "asg_max_size debe ser >= asg_min_size y <= 20."
+  }
+}
+
+variable "scaling_cpu_target" {
+  description = "CPU promedio (%) que el grupo intenta mantener: si sube, agrega instancias; si baja, quita"
+  type        = number
+  default     = 60
+}
+
+variable "scaling_requests_per_target" {
+  description = "Peticiones por minuto por instancia que el grupo intenta mantener (segunda señal de escalado)"
+  type        = number
+  default     = 1000
+}
+
+variable "instance_warmup" {
+  description = "Segundos que tarda una instancia nueva en estar lista (bootstrap + docker build en t3.micro)"
+  type        = number
+  default     = 600
+}
+
+variable "health_check_grace_period" {
+  description = "Segundos que el ASG espera antes de juzgar la salud de una instancia nueva"
+  type        = number
+  default     = 900
 }
 
 variable "instance_type" {
@@ -79,7 +128,7 @@ variable "key_name" {
 }
 
 variable "ssh_private_key_path" {
-  description = "Ruta local a la llave privada .pem (se escribe en el inventario de Ansible)"
+  description = "Ruta local a la llave privada .pem (la usa Ansible para conectarse por SSH)"
   type        = string
 }
 
@@ -140,6 +189,51 @@ variable "redis_node_type" {
   description = "Tipo de nodo de ElastiCache"
   type        = string
   default     = "cache.t4g.micro" # el nodo más pequeño/barato de ElastiCache
+}
+
+# ==========================================
+# APLICACIÓN (la despliega cada instancia al arrancar)
+# ==========================================
+variable "app_repo_url" {
+  description = "Repositorio de la API. Privado: SSH (git@github.com:USUARIO/REPO.git) + deploy key. Público: https"
+  type        = string
+}
+
+variable "app_repo_version" {
+  description = "Rama que se despliega"
+  type        = string
+  default     = "main"
+}
+
+variable "app_compose_file" {
+  description = "Archivo docker compose de producción dentro del repo de la API"
+  type        = string
+  default     = "docker-compose.prod.yml"
+}
+
+variable "app_port" {
+  description = "Puerto donde escucha la API dentro de cada instancia (Nginx le reenvía el tráfico)"
+  type        = number
+  default     = 3000
+}
+
+variable "app_extra_env" {
+  description = "Variables extra para el .env de la API (JWT_SECRET, NODE_ENV, etc.). Se guardan cifradas en SSM"
+  type        = map(string)
+  default     = {}
+  sensitive   = true
+}
+
+variable "github_deploy_key_path" {
+  description = "Ruta local a la deploy key (solo lectura) para clonar un repo privado. Vacío = repo público"
+  type        = string
+  default     = ""
+}
+
+variable "nginx_client_max_body_size" {
+  description = "Tamaño máximo de subida que acepta Nginx"
+  type        = string
+  default     = "10m"
 }
 
 # ==========================================

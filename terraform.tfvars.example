@@ -5,12 +5,29 @@ project     = "sysranchito"
 environment = "dev"
 domain_name = "tu-subdominio.duckdns.org"
 
-# EC2
-instance_count       = 3
+# EC2 (molde de cada instancia del Auto Scaling Group)
 instance_type        = "t3.micro"            # mínima viable para Docker + NestJS
 key_name             = "YOUR_SSH_KEY_NAME"       # Nombre del Key Pair en EC2 (sin .pem)
 ssh_private_key_path = "~/.ssh/YOUR_SSH_KEY.pem" # Ruta local a la llave privada
 ssh_allowed_cidrs    = ["0.0.0.0/0"]             # Recomendado: ["TU_IP_PUBLICA/32"]  (curl ifconfig.me)
+
+# Auto Scaling Group: mínimo 1, recomendado 3, máximo 10
+asg_min_size                = 1
+asg_desired_capacity        = 3
+asg_max_size                = 10
+scaling_cpu_target          = 60   # % de CPU promedio que intenta mantener
+scaling_requests_per_target = 1000 # peticiones por minuto por instancia
+
+# Aplicación: cada instancia la clona y la levanta sola al arrancar
+app_repo_url           = "git@github.com:TU_USUARIO/TU_API.git"
+app_repo_version       = "main"                       # rama a desplegar
+app_compose_file       = "docker-compose.prod.yml"
+app_port               = 3000
+github_deploy_key_path = "secrets/github_deploy_key"  # vacío ("") si el repo es público
+app_extra_env = {
+  NODE_ENV   = "production"
+  JWT_SECRET = "CAMBIA_ESTO" # openssl rand -hex 32
+}
 
 # Balanceadores / WebSockets
 lb_idle_timeout        = 3600 # segundos que una conexión WebSocket inactiva sigue abierta
