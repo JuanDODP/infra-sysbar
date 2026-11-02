@@ -1,0 +1,170 @@
+#!/bin/bash
+# =============================================================================
+# Bootstrap de cada instancia del Auto Scaling Group (cloud-init, primer arranque).
+# Plantilla de Terraform (templatefile): Terraform sustituye las variables con dólar y llaves.
+# Log en la instancia: /var/log/sysbar-bootstrap.log
+# =============================================================================
+set -euxo pipefail
+exec > >(tee -a /var/log/sysbar-bootstrap.log) 2>&1
+export DEBIAN_FRONTEND=noninteractive
+
+# --- 1. Swap de 2 GB: t3.micro tiene 1 GB de RAM y `docker build` lo rebasa ---
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+
+# --- 2. Paquetes base, AWS CLI y Docker ---
+apt-get update -y
+apt-get install -y curl git ufw fail2ban nginx
+snap install aws-cli --classic || true
+if ! command -v docker >/dev/null; then
+  curl -fsSL https://get.docker.com | sh
+fi
+systemctl enable --now docker
+usermod -aG docker ubuntu
+
+# --- 3. Seguridad: Fail2ban (SSH) y firewall (solo 22 y 80) ---
+cat > /etc/fail2ban/jail.local <<'JAIL'
+[DEFAULT]
+bantime  = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+port    = ssh
+JAIL
+systemctl enable fail2ban
+systemctl restart fail2ban
+ufw allow 22/tcp
+ufw allow 80/tcp
+ufw --force enable
+
+# --- 4. Nginx: HTTP (el TLS termina en el ALB) + WebSockets ---
+cat > /etc/nginx/sites-available/app.conf <<'NGINX'
+# Generado por el bootstrap del Auto Scaling Group. Nginx detrás de NLB -> ALB.
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      '';
+}
+
+map $http_x_forwarded_proto $app_forwarded_proto {
+    default $http_x_forwarded_proto;
+    ''      $scheme;
+}
+
+map $http_x_forwarded_for $app_forwarded_for {
+    default $http_x_forwarded_for;
+    ''      $remote_addr;
+}
+
+upstream app_backend {
+    server 127.0.0.1:${app_port};
+    keepalive 32;
+}
+
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${domain_name} _;
+
+    client_max_body_size ${client_max_body_size};
+
+    # IP real del cliente (el NLB la conserva y el ALB la pone en X-Forwarded-For)
+    set_real_ip_from ${vpc_cidr};
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive on;
+
+    location = /nginx-health {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    location / {
+        proxy_pass http://app_backend;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+        proxy_cache_bypass $http_upgrade;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $app_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $app_forwarded_proto;
+        proxy_set_header X-Forwarded-Port $http_x_forwarded_port;
+
+        proxy_connect_timeout 10s;
+        proxy_send_timeout ${idle_timeout}s;
+        proxy_read_timeout ${idle_timeout}s;
+        proxy_buffering off;
+    }
+}
+NGINX
+ln -sf /etc/nginx/sites-available/app.conf /etc/nginx/sites-enabled/app.conf
+rm -f /etc/nginx/sites-enabled/default
+nginx -t
+systemctl enable nginx
+systemctl reload nginx
+
+# --- 5. Script de despliegue (lo usa este bootstrap y también Ansible en cada deploy) ---
+cat > /usr/local/bin/app-deploy <<'DEPLOY'
+#!/bin/bash
+# Descarga el código de la rama configurada, genera el .env desde SSM y levanta el contenedor.
+# Uso: sudo app-deploy
+set -euo pipefail
+
+REGION="${region}"
+ENV_PARAM="${env_param}"
+KEY_PARAM="${key_param}"
+REPO_URL="${repo_url}"
+BRANCH="${branch}"
+COMPOSE_FILE="${compose_file}"
+APP_DIR="/var/www/app"
+AWS="/snap/bin/aws"
+
+# Identidad de la instancia (IMDSv2) para identificarla en logs y en /api/health
+TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+INSTANCE_ID=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+# Repo privado: deploy key de solo lectura desde SSM
+if [ -n "$KEY_PARAM" ]; then
+  install -d -m 700 /root/.ssh
+  $AWS ssm get-parameter --region "$REGION" --name "$KEY_PARAM" --with-decryption \
+    --query Parameter.Value --output text > /root/.ssh/app_deploy_key
+  chmod 600 /root/.ssh/app_deploy_key
+  export GIT_SSH_COMMAND="ssh -i /root/.ssh/app_deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+fi
+
+# Código: clonar la primera vez, actualizar a la punta de la rama después
+mkdir -p /var/www
+if [ -d "$APP_DIR/.git" ]; then
+  git -C "$APP_DIR" fetch --depth 1 origin "$BRANCH"
+  git -C "$APP_DIR" reset --hard FETCH_HEAD
+else
+  git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
+fi
+
+# .env desde SSM (cifrado) + identificador de la instancia
+$AWS ssm get-parameter --region "$REGION" --name "$ENV_PARAM" --with-decryption \
+  --query Parameter.Value --output text > "$APP_DIR/.env.tmp"
+echo "INSTANCE_NAME=$INSTANCE_ID" >> "$APP_DIR/.env.tmp"
+chmod 600 "$APP_DIR/.env.tmp"
+mv "$APP_DIR/.env.tmp" "$APP_DIR/.env"
+
+# Construir y levantar
+cd "$APP_DIR"
+docker compose -f "$COMPOSE_FILE" up -d --build --remove-orphans
+docker image prune -f >/dev/null 2>&1 || true
+echo "app-deploy: $(git -C "$APP_DIR" rev-parse --short HEAD) desplegado en $INSTANCE_ID"
+DEPLOY
+chmod 755 /usr/local/bin/app-deploy
+
+# --- 6. Primer despliegue ---
+/usr/local/bin/app-deploy
+echo "Bootstrap completo"
