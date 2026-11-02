@@ -18,15 +18,19 @@ output "alb_dns_name" {
   value       = aws_lb.alb.dns_name
 }
 
-output "ec2_instances" {
-  description = "Instancias EC2 (nombre => IP pública para SSH / IP privada)"
+output "autoscaling" {
+  description = "Auto Scaling Group de la API (las instancias se crean y destruyen solas)"
   value = {
-    for i in aws_instance.app_server : i.tags["Name"] => {
-      public_ip  = i.public_ip
-      private_ip = i.private_ip
-      az         = i.availability_zone
-    }
+    name    = aws_autoscaling_group.app.name
+    min     = aws_autoscaling_group.app.min_size
+    desired = var.asg_desired_capacity
+    max     = aws_autoscaling_group.app.max_size
   }
+}
+
+output "ver_instancias" {
+  description = "Comando para ver las instancias vivas del Auto Scaling Group"
+  value       = "cd ansible && ./inventory.py --list"
 }
 
 output "rds_endpoint" {

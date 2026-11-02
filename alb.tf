@@ -1,4 +1,4 @@
-# ALB interno: termina TLS y reparte el tráfico (HTTP y WebSockets) entre las EC2
+# ALB interno: termina TLS y reparte el tráfico (HTTP y WebSockets) entre las instancias del ASG
 resource "aws_lb" "alb" {
   name               = "${local.name_prefix}-alb"
   internal           = true
@@ -45,13 +45,7 @@ resource "aws_lb_target_group" "app" {
   tags = { Name = "${local.name_prefix}-tg" }
 }
 
-resource "aws_lb_target_group_attachment" "app" {
-  count = var.instance_count
-
-  target_group_arn = aws_lb_target_group.app.arn
-  target_id        = aws_instance.app_server[count.index].id
-  port             = 80
-}
+# Las instancias las registra el Auto Scaling Group (asg.tf -> target_group_arns)
 
 # HTTP -> HTTPS
 resource "aws_lb_listener" "http" {
