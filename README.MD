@@ -1,30 +1,32 @@
-# 🚀 INFRA-SYSBAR — Infraestructura multi-servidor en AWS
+# 🚀 INFRA-SYSBAR — Infraestructura con Auto Scaling en AWS
 
-Este repositorio crea y configura, con unos pocos comandos, todo lo necesario para publicar una **API NestJS con WebSockets** en internet, repartida en **3 servidores** para que sea más estable, con **HTTPS** y un **dominio gratuito de DuckDNS**.
+Este repositorio crea y configura, con unos pocos comandos, todo lo necesario para publicar una **API en Docker con WebSockets** (probada con NestJS) en internet. Usa un **grupo de servidores que crece y se reduce solo según el tráfico** (Auto Scaling), con **HTTPS** y un **dominio gratuito de DuckDNS**.
 
-- **Terraform** crea la infraestructura en AWS (servidores, balanceadores, base de datos…).
-- **Ansible** configura los servidores y despliega la aplicación.
+- **Terraform** crea la infraestructura en AWS: balanceadores, Auto Scaling Group, base de datos, Redis y permisos.
+- **Cada servidor se configura solo al encenderse** (cloud-init): instala Docker y Nginx, clona tu API y la levanta.
+- **Ansible** obtiene el certificado, apunta el dominio y despliega nuevas versiones en los servidores que estén vivos.
 
-> 💡 **En palabras simples:** en lugar de tener tu aplicación en una sola computadora (si se cae, se cae todo), la tienes en 3 computadoras. Un "recepcionista" (el balanceador) recibe a cada visitante y lo manda a la computadora que esté libre. Si una falla, el recepcionista deja de mandarle gente y las otras dos siguen atendiendo.
+> 💡 **En palabras simples:** tu aplicación no vive en una sola computadora, sino en un **equipo de computadoras** que AWS administra por ti. En horas tranquilas basta con 1. Normalmente hay 3. Si llega mucha gente, AWS enciende más, hasta 10, y cuando la gente se va, las apaga para no cobrarte de más. Un "recepcionista" (el balanceador) reparte a cada visitante entre las computadoras disponibles.
 
 ---
 
 ## 📑 Índice
 
 1. [Arquitectura](#-arquitectura)
-2. [Glosario rápido](#-glosario-rápido)
-3. [Estructura del repositorio](#-estructura-del-repositorio)
-4. [Requisitos](#-requisitos)
-5. [Configuración: archivos `.example`](#%EF%B8%8F-configuración-archivos-example)
-6. [Despliegue paso a paso](#-despliegue-paso-a-paso)
-7. [Requisitos de la aplicación (API)](#-requisitos-de-la-aplicación-api)
-8. [Verificar que todo funciona](#-verificar-que-todo-funciona)
-9. [Operación del día a día](#-operación-del-día-a-día)
-10. [Apagar y volver a encender](#-apagar-y-volver-a-encender)
-11. [Solución de problemas](#-solución-de-problemas)
-12. [Costos](#-costos)
-13. [Seguridad](#-seguridad)
-14. [Limitaciones y mejoras futuras](#-limitaciones-y-mejoras-futuras)
+2. [Auto Scaling: mínimo 1, recomendado 3, máximo 10](#-auto-scaling-mínimo-1-recomendado-3-máximo-10)
+3. [Glosario rápido](#-glosario-rápido)
+4. [Estructura del repositorio](#-estructura-del-repositorio)
+5. [Requisitos](#-requisitos)
+6. [Configuración: archivos `.example`](#%EF%B8%8F-configuración-archivos-example)
+7. [Despliegue paso a paso](#-despliegue-paso-a-paso)
+8. [Requisitos de la aplicación (API)](#-requisitos-de-la-aplicación-api)
+9. [Verificar que todo funciona](#-verificar-que-todo-funciona)
+10. [Operación del día a día](#-operación-del-día-a-día)
+11. [Apagar y volver a encender](#%EF%B8%8F-apagar-y-volver-a-encender)
+12. [Solución de problemas](#%EF%B8%8F-solución-de-problemas)
+13. [Costos](#-costos)
+14. [Seguridad](#-seguridad)
+15. [Limitaciones y mejoras futuras](#-limitaciones-y-mejoras-futuras)
 
 ---
 
@@ -42,29 +44,81 @@ Este repositorio crea y configura, con unos pocos comandos, todo lo necesario pa
                      │ ALB interno                  │  Termina HTTPS (certificado Let's Encrypt en ACM)
                      │  80  → redirige a 443        │  Timeout de 3600 s para WebSockets
                      │  443 → Target Group          │  Health check: GET /api/health
-                     └──────┬──────────┬────────┬───┘
-                            ▼          ▼        ▼
-                        EC2-1 (a)   EC2-2 (b)  EC2-3 (c)    Nginx :80 → API :3000 (Docker)
-                            │          │        │
-                            ├──────────┴────────┤
-                            ▼                   ▼
-                   RDS PostgreSQL        ElastiCache Redis
-                   (compartida)          (sincroniza Socket.IO entre servidores)
+                     └──────────────┬───────────────┘
+                                    ▼
+        ┌────────────────── Auto Scaling Group (mín 1 · deseado 3 · máx 10) ──────────────────┐
+        │   instancia (1a)     instancia (1b)     instancia (1c)     …  hasta 10               │
+        │   Nginx :80 → API :3000 (Docker), configuradas solas con cloud-init                   │
+        └───────┬───────────────────────────────┬──────────────────────────────┬───────────────┘
+                ▼                               ▼                              ▼
+       RDS PostgreSQL                 ElastiCache Redis              SSM Parameter Store
+       (compartida)                   (Socket.IO entre servidores)   (.env y deploy key cifrados)
 ```
 
 | Pieza | Qué hace (simple) | Detalle técnico |
 |---|---|---|
 | **DuckDNS** | El "nombre" de tu sitio | Registro A apuntando a la IP elástica del NLB |
-| **NLB** (Network Load Balancer) | La puerta de entrada con una **dirección fija** | Única IP pública estable; reenvía TCP 80/443 al ALB, en una sola zona |
+| **NLB** (Network Load Balancer) | La puerta de entrada con una **dirección fija** | Única IP pública estable; reenvía TCP 80/443 al ALB |
 | **ALB** (Application Load Balancer) | El recepcionista que reparte a los visitantes | Interno; termina TLS, health checks, *sticky sessions*, idle timeout de 3600 s |
-| **3 × EC2** | Las 3 computadoras donde corre tu API | Ubuntu 24.04, `t3.micro`, una por zona (a, b, c); Nginx → contenedor Docker |
-| **RDS PostgreSQL** | La base de datos que comparten las 3 | `db.t4g.micro`, privada, solo accesible desde las EC2 |
-| **ElastiCache Redis** | El "chat interno" entre servidores | Adaptador de Socket.IO: un evento emitido en un servidor llega a los clientes de los otros |
+| **Auto Scaling Group** | El jefe de turno que decide cuántas computadoras trabajan | Mín 1, deseado 3, máx 10; escala por CPU y por peticiones; reemplaza instancias caídas |
+| **Launch Template** | El "molde" con el que nace cada computadora | Ubuntu 24.04, `t3.micro`, disco gp3 cifrado, rol IAM, script de arranque |
+| **Instancias EC2** | Las computadoras donde corre tu API | Nginx → contenedor Docker; repartidas en las zonas a, b y c |
+| **SSM Parameter Store** | La caja fuerte de la configuración | `.env` y deploy key como `SecureString`; cada instancia los lee al arrancar |
+| **RDS PostgreSQL** | La base de datos que comparten todas | `db.t4g.micro`, privada, solo accesible desde las instancias |
+| **ElastiCache Redis** | El "chat interno" entre servidores | Adaptador de Socket.IO: un evento emitido en un servidor llega a los clientes de los demás |
 | **ACM** | Guarda el candado HTTPS | Certificado de Let's Encrypt importado (ACM no emite para `duckdns.org`) |
 
 **¿Por qué NLB + ALB y no solo ALB?** Un ALB **no puede tener IP fija**, y DuckDNS **solo acepta IPs** (no permite apuntar a un nombre/CNAME). El NLB aporta la IP fija; el ALB aporta el reparto inteligente HTTP/WebSocket y el HTTPS.
 
-**¿Por qué Redis?** Con WebSockets, cada usuario queda conectado a **un** servidor. Si la caja está en el servidor 1 y la cocina en el servidor 2, sin Redis la cocina nunca se enteraría de la orden. Redis comparte los eventos entre los 3.
+**¿Por qué Redis?** Con WebSockets, cada usuario queda conectado a **un** servidor. Si la caja está en el servidor 1 y la cocina en el servidor 2, sin Redis la cocina nunca se enteraría de la orden. Redis comparte los eventos entre todos.
+
+---
+
+## 📈 Auto Scaling: mínimo 1, recomendado 3, máximo 10
+
+| Valor | Variable | Por defecto | Significado |
+|---|---|---|---|
+| **Mínimo** | `asg_min_size` | **1** | Nunca habrá menos instancias, aunque no haya tráfico |
+| **Recomendado (deseado)** | `asg_desired_capacity` | **3** | Con cuántas instancias arranca el grupo |
+| **Máximo** | `asg_max_size` | **10** | Tope cuando el tráfico es máximo |
+
+### ¿Cuándo crece y cuándo se reduce?
+
+El grupo usa dos políticas de **target tracking**. AWS intenta mantener cada métrica cerca de su objetivo:
+
+| Política | Variable | Objetivo | Efecto |
+|---|---|---|---|
+| CPU promedio | `scaling_cpu_target` | **60 %** | Si la CPU promedio pasa de 60 %, agrega instancias |
+| Peticiones por instancia | `scaling_requests_per_target` | **1000 / min** | Si cada instancia recibe más de 1000 peticiones por minuto, agrega instancias |
+
+- **Crece** si **cualquiera** de las dos métricas supera su objetivo.
+- **Se reduce** solo cuando **ambas** están por debajo, y nunca baja de `asg_min_size`.
+- AWS reduce de forma conservadora: tras un pico, las instancias extra se retiran poco a poco (minutos).
+
+### Qué pasa cuando nace una instancia
+
+1. El ASG la lanza con el **launch template** en la zona con menos instancias.
+2. **cloud-init** ejecuta el bootstrap (`templates/user_data.sh.tftpl`): crea el swap, instala Docker, Nginx, UFW y Fail2ban, lee el `.env` y la deploy key de **SSM**, clona la rama de tu API y hace `docker compose up --build`.
+3. Mientras construye (**≈ 8–10 min** en `t3.micro`), el ALB aún no le manda tráfico.
+4. Cuando `GET /api/health` responde 200, el ALB la marca como sana y empieza a recibir usuarios.
+5. Si una instancia deja de responder, el ASG la **reemplaza automáticamente** por una nueva.
+
+> ⚠️ Una instancia nueva tarda ~10 minutos en estar lista, porque construye la imagen de Docker. El escalado sirve para aumentos de tráfico sostenidos, no para picos de segundos. Para escalar más rápido, mira [Limitaciones y mejoras](#-limitaciones-y-mejoras-futuras).
+
+> 🔌 **WebSockets y reducción:** cuando el grupo se reduce, los usuarios conectados a la instancia que se retira pierden la conexión unos segundos. Socket.IO se **reconecta solo** a otra instancia.
+
+### Cambiar el tamaño a mano
+
+```bash
+# Ver el estado del grupo
+aws autoscaling describe-auto-scaling-groups --auto-scaling-group-names sysranchito-dev-asg \
+  --query 'AutoScalingGroups[0].{min:MinSize,deseado:DesiredCapacity,max:MaxSize,instancias:Instances[].[InstanceId,AvailabilityZone,HealthStatus,LifecycleState]}'
+
+# Fijar el número de instancias ahora mismo (entre el mínimo y el máximo)
+aws autoscaling set-desired-capacity --auto-scaling-group-name sysranchito-dev-asg --desired-capacity 5
+```
+
+Para cambiar el **mínimo o el máximo**, edita `asg_min_size` / `asg_max_size` en `terraform.tfvars` y ejecuta `terraform apply`. Terraform ignora a propósito los cambios en el número deseado, porque ese valor lo ajustan las políticas de escalado.
 
 ---
 
@@ -74,15 +128,22 @@ Este repositorio crea y configura, con unos pocos comandos, todo lo necesario pa
 |---|---|
 | **AWS** | Amazon Web Services: la nube donde se rentan los servidores |
 | **Región** | Ubicación física de AWS. Este proyecto usa `us-east-1` (Norte de Virginia) |
-| **EC2** | Un servidor virtual (una computadora en la nube) |
-| **Key Pair / `.pem`** | La "llave" para entrar por SSH a los servidores. Es por región |
+| **EC2 / instancia** | Un servidor virtual (una computadora en la nube) |
+| **Auto Scaling Group (ASG)** | Grupo de instancias que AWS agranda, reduce y repara automáticamente |
+| **Launch Template** | Molde con el que se crea cada instancia del ASG |
+| **Target tracking** | Política de escalado que mantiene una métrica (CPU, peticiones) cerca de un objetivo |
+| **cloud-init / user_data** | Script que una instancia ejecuta sola la primera vez que enciende |
+| **Instance refresh** | Reemplazo gradual de todas las instancias por otras nuevas, sin cortar el servicio |
+| **SSM Parameter Store** | Almacén de AWS para configuración y secretos cifrados |
+| **Deploy key** | Llave SSH de **solo lectura** para un único repositorio de GitHub |
+| **Key Pair / `.pem`** | La "llave" para entrar por SSH a las instancias. Es por región |
 | **Security Group** | Firewall de AWS: decide quién puede conectarse a qué puerto |
-| **IP elástica** | IP pública fija que no cambia aunque reinicies recursos |
+| **IP elástica** | IP pública fija que no cambia |
 | **Terraform** | Herramienta que crea infraestructura a partir de archivos `.tf` |
 | **`terraform.tfstate`** | "Memoria" de Terraform: qué creó. Contiene datos sensibles |
-| **Ansible** | Herramienta que se conecta por SSH y configura servidores con *playbooks* (`.yml`) |
+| **Ansible** | Herramienta que se conecta por SSH y ejecuta tareas con *playbooks* (`.yml`) |
+| **Inventario dinámico** | Lista de servidores que Ansible obtiene de AWS en cada ejecución |
 | **Health check** | Revisión periódica: si un servidor no responde 200, deja de recibir tráfico |
-| **Let's Encrypt** | Autoridad que emite certificados HTTPS gratuitos (duran 90 días) |
 | **Rolling deploy** | Actualizar los servidores uno por uno, sin apagar el servicio |
 
 ---
@@ -93,43 +154,44 @@ Este repositorio crea y configura, con unos pocos comandos, todo lo necesario pa
 infra-sysbar/
 ├── provider.tf               # Proveedores (aws, local, time) y perfil de AWS
 ├── variables.tf              # Todas las variables configurables (con descripción)
-├── locals.tf                 # Valores calculados (nombres, zonas, subnets)
+├── locals.tf                 # Valores calculados (nombres, zonas, contenido del .env)
 ├── network.tf                # VPC por defecto, subnets y AMI de Ubuntu 24.04
-├── security_groups.tf        # Firewalls de NLB, ALB y EC2
-├── main.tf                   # Las instancias EC2
+├── security_groups.tf        # Firewalls de NLB, ALB e instancias
+├── asg.tf                    # Launch template, Auto Scaling Group y políticas de escalado
+├── iam.tf                    # Rol de las instancias (leer SSM + Session Manager)
+├── ssm.tf                    # .env y deploy key cifrados en SSM Parameter Store
 ├── alb.tf                    # ALB interno, target group y listeners 80/443
 ├── nlb.tf                    # IP elástica, NLB y conexión NLB → ALB
 ├── certificate.tf            # Importa el certificado de certs/ a ACM
 ├── rds.tf                    # PostgreSQL
 ├── redis.tf                  # ElastiCache Redis
-├── ansible_inventory.tf      # Genera el inventario y variables para Ansible
+├── ansible_inventory.tf      # Genera la configuración que usa Ansible
 ├── outputs.tf                # Datos que muestra Terraform al terminar
 ├── templates/
-│   └── inventory.ini.tftpl   # Plantilla del inventario de Ansible
+│   └── user_data.sh.tftpl    # Bootstrap de cada instancia (Docker, Nginx, firewall, app-deploy)
 ├── terraform.tfvars.example  # 📝 PLANTILLA → copiar a terraform.tfvars
 ├── ansible/
-│   ├── ansible.cfg           # Configuración de Ansible (SSH estable)
-│   ├── certificado.yml       # Paso 1: certificado HTTPS (corre en tu computadora)
-│   ├── duckdns.yml           # Paso 3: apunta el dominio a la IP elástica
-│   ├── deploy.yml            # Paso 4: configura servidores y despliega la API
-│   ├── nginx.conf.j2         # Nginx con soporte WebSocket
-│   ├── app.env.j2            # Plantilla del .env de la API
-│   ├── vars.yml.example      # 📝 PLANTILLA → copiar a vars.yml
-│   └── inventory.ini.example # Solo referencia (el real lo genera Terraform)
+│   ├── ansible.cfg           # Configuración de Ansible (inventario dinámico, SSH estable)
+│   ├── inventory.py          # Inventario dinámico: instancias vivas del ASG (usa la AWS CLI)
+│   ├── certificado.yml       # Certificado HTTPS (corre en tu computadora)
+│   ├── duckdns.yml           # Apunta el dominio a la IP elástica
+│   ├── deploy.yml            # Despliega una nueva versión en las instancias vivas (rolling)
+│   └── vars.yml.example      # 📝 PLANTILLA → copiar a vars.yml
 └── scripts/
     ├── package.json
     └── test-websockets.mjs   # Prueba de WebSockets entre servidores
 ```
 
-**Archivos que se generan solos y NUNCA se suben a git** (ya están en `.gitignore`):
+**Archivos locales que NUNCA se suben a git** (ya están en `.gitignore`):
 
 | Archivo | Lo crea | Contiene |
 |---|---|---|
-| `terraform.tfvars` | Tú (desde el `.example`) | Tu configuración y contraseña de la BD |
-| `ansible/vars.yml` | Tú (desde el `.example`) | Token de DuckDNS, secretos de la app |
+| `terraform.tfvars` | Tú (desde el `.example`) | Tu configuración, contraseña de la BD y secretos de la app |
+| `ansible/vars.yml` | Tú (desde el `.example`) | Token de DuckDNS y correo |
+| `secrets/github_deploy_key` | Tú (`ssh-keygen`) | Llave privada de solo lectura para clonar la API |
 | `certs/` | `certificado.yml` | Certificado y **llave privada** HTTPS |
-| `ansible/inventory.ini` | Terraform | IPs públicas de los servidores |
-| `ansible/group_vars/all/infra.yml` | Terraform | Endpoints de RDS/Redis y contraseña de la BD |
+| `ansible/.aws_inventory.json` | Terraform | Región, perfil y nombre del ASG para el inventario dinámico |
+| `ansible/group_vars/all/infra.yml` | Terraform | IP elástica, nombre del ASG, puerto y health check |
 | `terraform.tfstate*` | Terraform | Estado completo (incluye secretos) |
 
 ---
@@ -138,9 +200,9 @@ infra-sysbar/
 
 ### Cuentas
 
-- **AWS** con permisos de administrador (usuario de IAM Identity Center/SSO o usuario IAM) y una tarjeta registrada.
+- **AWS** con permisos de administrador (usuario de IAM Identity Center/SSO o usuario IAM) y una tarjeta registrada. Terraform crea un rol IAM, así que se necesitan permisos de IAM.
 - **DuckDNS** (gratis, se entra con Google/GitHub): <https://www.duckdns.org>. Crea tu subdominio, por ejemplo `mi-app` → `mi-app.duckdns.org`.
-- **GitHub** con la llave SSH configurada, si la API está en un repositorio privado.
+- **GitHub**: el repositorio de tu API. Si es privado, necesitas permiso para agregarle una **deploy key**.
 
 ### Herramientas en tu computadora
 
@@ -149,49 +211,52 @@ infra-sysbar/
 | AWS CLI | v2 | `brew install awscli` |
 | Terraform | ≥ 1.9 | `brew tap hashicorp/tap && brew install hashicorp/tap/terraform` |
 | Ansible | completo (incluye `community.general`) | `brew install ansible` |
+| Python 3 | ≥ 3.8 (lo usa el inventario dinámico) | Ya viene en macOS (Xcode CLT) |
 | Node.js | ≥ 18 (solo para la prueba de WebSockets) | `brew install node` |
-| git, openssl, dig, curl | — | Ya vienen en macOS |
+| git, ssh-keygen, openssl, dig, curl | — | Ya vienen en macOS |
 
 > En Linux: usa el gestor de paquetes de tu distribución (`apt`, `dnf`) o las guías oficiales de cada herramienta. Funciona igual en Mac Intel o Apple Silicon (M1–M4).
 
-Comprueba que todo está instalado:
-
 ```bash
-aws --version && terraform version && ansible --version | head -1 && node --version
+aws --version && terraform version && ansible --version | head -1 && python3 --version && node --version
 ```
 
 ---
 
 ## ⚙️ Configuración: archivos `.example`
 
-El repositorio **no incluye datos reales** (IPs, contraseñas, tokens). En su lugar trae **plantillas** que terminan en `.example`. **Debes copiarlas y reemplazar los valores** para que el proyecto funcione:
+El repositorio **no incluye datos reales** (IPs, contraseñas, tokens, llaves). En su lugar trae **plantillas** que terminan en `.example`. **Debes copiarlas y reemplazar los valores** para que el proyecto funcione:
 
 ```bash
 cp terraform.tfvars.example terraform.tfvars
 cp ansible/vars.yml.example ansible/vars.yml
 ```
 
-> ⚠️ **Copia, no renombres.** El `.example` debe seguir existiendo (es la plantilla del repositorio). Tus copias (`terraform.tfvars`, `vars.yml`) están en `.gitignore` y nunca se suben.
->
-> `ansible/inventory.ini.example` **no** se copia: el `inventory.ini` real lo genera Terraform automáticamente.
+> ⚠️ **Copia, no renombres.** El `.example` debe seguir existiendo (es la plantilla del repositorio). Tus copias están en `.gitignore` y nunca se suben.
 
-### 1. `terraform.tfvars`
+### 1. `terraform.tfvars` — infraestructura y aplicación
 
 | Variable | Qué poner | Cómo obtenerlo |
 |---|---|---|
 | `aws_region` | `us-east-1` (u otra región) | Debe ser la misma donde está tu Key Pair |
 | `aws_profile` | Nombre de tu perfil de AWS CLI | Ver [Credenciales de AWS](#credenciales-de-aws) |
 | `domain_name` | `tu-subdominio.duckdns.org` | Tu subdominio en DuckDNS |
-| `instance_count` | `3` | Número de servidores |
 | `key_name` | Nombre del Key Pair, **sin** `.pem` | Ver [Key Pair](#key-pair-llave-ssh) |
 | `ssh_private_key_path` | `~/.ssh/TU_LLAVE.pem` | Ruta donde guardaste el `.pem` |
 | `ssh_allowed_cidrs` | `["TU_IP/32"]` | `curl -4 ifconfig.me` (usa la **IPv4**). Para pruebas puedes dejar `["0.0.0.0/0"]` |
+| `asg_min_size` / `asg_desired_capacity` / `asg_max_size` | `1` / `3` / `10` | Ver [Auto Scaling](#-auto-scaling-mínimo-1-recomendado-3-máximo-10) |
+| `app_repo_url` | `git@github.com:TU_USUARIO/TU_API.git` | Repo de la API (SSH si es privado, `https://` si es público) |
+| `app_repo_version` | Rama a desplegar (ej. `main`, `develop`) | — |
+| `app_compose_file` | `docker-compose.prod.yml` | Compose de producción dentro del repo de la API |
+| `app_port` | `3000` | Puerto donde escucha tu API |
+| `github_deploy_key_path` | `secrets/github_deploy_key` | Ver [Deploy key](#deploy-key-de-github-repo-privado). Vacío (`""`) si el repo es público |
+| `app_extra_env` | Mapa de variables extra del `.env` | Ej. `JWT_SECRET` (genera uno con `openssl rand -hex 32`), `NODE_ENV` |
 | `health_check_path` | `/api/health` | Ruta de salud de tu API (debe responder 200) |
 | `db_password` | Contraseña de la BD | Mínimo 8 caracteres, **sin** `@`, `/`, `"` ni espacios |
 
 Las demás variables tienen valores por defecto razonables; todas están documentadas en `variables.tf`.
 
-### 2. `ansible/vars.yml`
+### 2. `ansible/vars.yml` — dominio y certificado
 
 | Variable | Qué poner |
 |---|---|
@@ -199,15 +264,10 @@ Las demás variables tienen valores por defecto razonables; todas están documen
 | `duckdns_subdomain` | Solo la parte antes de `.duckdns.org` (ej. `mi-app`) |
 | `duckdns_token` | Tu token de DuckDNS (en duckdns.org, arriba: **token**; si el navegador traduce la página aparece como **"simbólico"**) |
 | `acme_email` | Tu correo (Let's Encrypt avisa si el certificado va a vencer) |
-| `app_repo_url` | Repo de la API por SSH, ej. `git@github.com:TU_USUARIO/TU_API.git`. **Vacío** = solo prepara los servidores |
-| `app_repo_version` | Rama a desplegar (ej. `main`, `develop`) |
-| `app_compose_file` | Compose de producción dentro del repo de la API (ej. `docker-compose.prod.yml`) |
-| `app_service` | Nombre del servicio en ese compose (ej. `api`) |
-| `app_extra_env` | Variables extra para el `.env` de la API, ej. `JWT_SECRET` (genera uno con `openssl rand -hex 32`) |
 
 ### Credenciales de AWS
 
-Terraform necesita saber con qué cuenta de AWS trabajar. Elige **una** opción:
+Terraform y el inventario dinámico de Ansible necesitan saber con qué cuenta de AWS trabajar. Elige **una** opción:
 
 **Opción A — IAM Identity Center / SSO (recomendada si entras a AWS por un portal `https://d-xxxx.awsapps.com/start`):**
 
@@ -227,9 +287,7 @@ La sesión SSO **expira cada día**; cuando veas `Token has expired`, renuévala
 aws sso login --profile TU_PERFIL_AWS
 ```
 
-**Opción B — Usuario IAM con access keys:** crea un usuario IAM dedicado (ej. `terraform`) con las políticas `AmazonEC2FullAccess`, `ElasticLoadBalancingFullAccess`, `AmazonRDSFullAccess`, `AmazonElastiCacheFullAccess` y `AWSCertificateManagerFullAccess`; crea una **clave de acceso** de tipo CLI y ejecuta `aws configure --profile TU_PERFIL_AWS`. **Nunca** uses claves del usuario root.
-
-Comprueba:
+**Opción B — Usuario IAM con access keys:** crea un usuario IAM dedicado (ej. `terraform`) con `AdministratorAccess` (Terraform crea roles IAM, Auto Scaling, EC2, ELB, RDS, ElastiCache, SSM y ACM). Crea una **clave de acceso** de tipo CLI y ejecuta `aws configure --profile TU_PERFIL_AWS`. **Nunca** uses claves del usuario root.
 
 ```bash
 aws sts get-caller-identity --profile TU_PERFIL_AWS
@@ -239,7 +297,7 @@ aws sts get-caller-identity --profile TU_PERFIL_AWS
 
 Los Key Pairs **existen solo en la región donde se crean**.
 
-1. Consola de AWS → arriba a la derecha selecciona tu región (ej. **N. Virginia us-east-1**).
+1. En la consola de AWS, arriba a la derecha, selecciona tu región (ej. **N. Virginia us-east-1**).
 2. **EC2 → Red y seguridad → Pares de claves → Crear par de claves** → tipo **RSA**, formato **.pem**.
 3. Guarda la llave con los permisos correctos:
 
@@ -249,14 +307,27 @@ mv ~/Downloads/TU_LLAVE.pem ~/.ssh/TU_LLAVE.pem
 chmod 400 ~/.ssh/TU_LLAVE.pem
 ```
 
-### Llave de GitHub (solo si la API es privada)
+### Deploy key de GitHub (repo privado)
 
-Los servidores clonan tu repo **usando tu llave de GitHub a través de SSH** (agent forwarding); la llave nunca se copia a los servidores. Verifica:
+Las instancias del Auto Scaling Group nacen solas, sin ti conectado, así que necesitan su **propia** llave para clonar la API. Se usa una **deploy key**: una llave SSH de **solo lectura** que solo sirve para **un** repositorio.
 
-```bash
-ssh-add -l               # debe listar tu llave; si no: ssh-add --apple-use-keychain ~/.ssh/id_ed25519
-ssh -T git@github.com    # debe decir: Hi TU_USUARIO! You've successfully authenticated
-```
+1. Genera la llave (desde la raíz de este repo):
+
+   ```bash
+   mkdir -p secrets
+   ssh-keygen -t ed25519 -N "" -C "deploy-key-infra-sysbar" -f secrets/github_deploy_key
+   cat secrets/github_deploy_key.pub      # copia esta línea
+   ```
+
+2. En GitHub, abre **el repositorio de la API → Settings → Deploy keys → Add deploy key**.
+   - **Title:** `infra-sysbar (AWS Auto Scaling)`
+   - **Key:** pega el contenido de `github_deploy_key.pub`
+   - **No** marques *Allow write access* (solo lectura).
+   - Clic en **Add key**.
+
+3. En `terraform.tfvars`: `github_deploy_key_path = "secrets/github_deploy_key"`.
+
+Terraform guarda la llave privada **cifrada en SSM**. Cada instancia la descarga al arrancar. Si el repo es **público**, usa una URL `https://` en `app_repo_url` y deja `github_deploy_key_path = ""`.
 
 ---
 
@@ -272,14 +343,18 @@ ansible-playbook certificado.yml
 cd ..
 ```
 
-Obtiene un certificado de Let's Encrypt validando tu dominio con un registro TXT en DuckDNS. Los avisos `Unable to parse inventory.ini` son normales en este paso.
+Obtiene un certificado de Let's Encrypt validando tu dominio con un registro TXT en DuckDNS. Si aparece algún aviso sobre el inventario en este paso, es normal: todavía no hay instancias.
 ✅ Termina con `Certificado listo en certs/ (notAfter=...)`.
 
-### Paso 2 — Crear la infraestructura (≈ 10 min)
+### Paso 2 — Deploy key (solo la primera vez)
+
+Si tu API está en un repo privado, sigue [Deploy key de GitHub](#deploy-key-de-github-repo-privado).
+
+### Paso 3 — Crear la infraestructura (≈ 10 min + ≈ 10 min de arranque)
 
 ```bash
 terraform init
-terraform plan     # revisa: debe decir "Plan: N to add, 0 to change, 0 to destroy"
+terraform plan     # revisa: "Plan: N to add, 0 to change, 0 to destroy"
 terraform apply    # escribe: yes
 ```
 
@@ -288,14 +363,14 @@ terraform apply    # escribe: yes
 ```text
 public_ip      = "X.X.X.X"                    ← IP elástica (la del dominio)
 app_url        = "https://tu-subdominio.duckdns.org"
-ec2_instances  = { ...-ec2-1, ...-ec2-2, ...-ec2-3 }
+autoscaling    = { name = "...-asg", min = 1, desired = 3, max = 10 }
 rds_endpoint   = "....rds.amazonaws.com:5432"
 redis_endpoint = "....cache.amazonaws.com:6379"
 ```
 
-Terraform también escribe `ansible/inventory.ini` y `ansible/group_vars/all/infra.yml`: **no hay que copiar IPs a mano**.
+> ⏳ `terraform apply` termina **antes** de que las instancias estén listas. Durante los siguientes **~10 minutos**, el ASG enciende 3 instancias y cada una se configura y construye la API sola. No hace falta ejecutar ningún playbook para eso.
 
-### Paso 3 — Apuntar el dominio (≈ 1 min)
+### Paso 4 — Apuntar el dominio (≈ 1 min)
 
 ```bash
 cd ansible
@@ -304,29 +379,25 @@ ansible-playbook duckdns.yml
 
 ✅ `tu-subdominio.duckdns.org -> X.X.X.X`
 
-### Paso 4 — Configurar servidores y desplegar la API (≈ 15 min la primera vez)
+### Paso 5 — Comprobar que las instancias quedaron listas
 
 ```bash
-ansible-playbook deploy.yml
+./inventory.py --list                 # instancias vivas del ASG con su IP
+ansible webservers -m ping            # Ansible llega a todas
+ansible-playbook deploy.yml           # opcional: espera el bootstrap, verifica y confirma el sitio público
 ```
 
-Qué hace:
-
-1. En las 3 EC2 a la vez: swap de 2 GB, Docker, firewall (UFW: solo 22 y 80), Fail2ban y Nginx con WebSockets.
-2. Si `app_repo_url` está definido, **servidor por servidor**: clona la rama, genera el `.env`, construye la imagen y levanta el contenedor (`ASYNC POLL ... finished=False` mientras construye: es normal), verifica el health check y pasa al siguiente.
-3. Comprueba `https://tu-subdominio.duckdns.org/api/health` de punta a punta.
-
-✅ `PLAY RECAP` con `failed=0` y `unreachable=0` en las 3 instancias.
+✅ `deploy.yml` termina con `https://tu-subdominio.duckdns.org respondió 200 a través de NLB -> ALB -> ASG`.
 
 ---
 
 ## 🧩 Requisitos de la aplicación (API)
 
-La infraestructura sirve para cualquier API en Docker que escuche en el puerto `3000`, pero para aprovecharla al 100 % la API debe cumplir con esto:
+La infraestructura sirve para cualquier API en Docker. Para aprovecharla al 100 %, la API debe cumplir con esto:
 
 ### 1. Health check
 
-Un endpoint que responda **200** (por defecto `GET /api/health`). Sin él, el ALB marca los servidores como caídos y responde `503`.
+Un endpoint que responda **200** (por defecto `GET /api/health`). Sin él, el ALB marca las instancias como caídas y el ASG las reemplaza una y otra vez.
 
 ### 2. `docker-compose.prod.yml` en el repo de la API
 
@@ -337,14 +408,18 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:3000:3000"   # solo Nginx puede llegar (Docker se salta el firewall UFW)
-    env_file: .env              # lo genera Ansible
+    env_file: .env              # lo genera cada instancia desde SSM
 ```
 
-### 3. Variables de entorno que Ansible genera en `.env`
+### 3. Variables de entorno del `.env`
 
-`PORT`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_URL`, `INSTANCE_NAME` + todo lo de `app_extra_env`. Si tu API usa otros nombres, ajusta `ansible/app.env.j2`.
+Cada instancia escribe el `.env` con `PORT`, `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USERNAME`, `DB_PASSWORD`, `REDIS_HOST`, `REDIS_PORT`, `REDIS_URL` y `INSTANCE_NAME` (el ID de la instancia), más todo lo de `app_extra_env`. Si tu API usa otros nombres, ajusta `local.app_env` en `locals.tf`.
 
-### 4. WebSockets entre servidores (Socket.IO + NestJS)
+### 4. Sin estado local (stateless)
+
+Las instancias se crean y destruyen solas: **nada importante debe guardarse en su disco o en su memoria**. Sesiones en JWT o Redis, datos en RDS y archivos subidos en un servicio externo (ej. S3).
+
+### 5. WebSockets entre servidores (Socket.IO + NestJS)
 
 ```bash
 npm i @socket.io/redis-adapter redis
@@ -389,7 +464,7 @@ if (process.env.REDIS_URL) {                   // en local, sin REDIS_URL, funci
 await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
 ```
 
-### 5. Frontend
+### 6. Frontend
 
 - API: `https://tu-subdominio.duckdns.org/api`
 - Socket.IO: `io('https://tu-subdominio.duckdns.org', { transports: ['websocket'] })`
@@ -398,15 +473,15 @@ await app.listen(process.env.PORT ?? 3000, '0.0.0.0');
 
 ## ✅ Verificar que todo funciona
 
-**1. El balanceador reparte entre los 3 servidores:**
+**1. El balanceador reparte entre las instancias:**
 
 ```bash
 for i in 1 2 3 4 5 6; do curl -s https://tu-subdominio.duckdns.org/api/health; echo; done
 ```
 
-Deben alternarse `...-ec2-1`, `...-ec2-2` y `...-ec2-3` en el campo `instance`.
+En el campo `instance` deben alternarse los IDs de las instancias (`i-0abc...`). En el navegador verás siempre la misma por la cookie de afinidad (*sticky session*); es normal.
 
-**2. Los 3 servidores están conectados a Redis** (desde `ansible/`):
+**2. Todas las instancias están conectadas a Redis** (desde `ansible/`):
 
 ```bash
 ansible webservers -b -m shell -a "docker logs SYSRANCHITO_API 2>&1 | grep -iE 'redis|escuchando' | tail -3"
@@ -422,7 +497,9 @@ npm install
 node test-websockets.mjs https://tu-subdominio.duckdns.org
 ```
 
-✅ `Recibieron el evento: 9/9` → los eventos llegan a los clientes de todos los servidores.
+✅ `Recibieron el evento: 9/9`: los eventos llegan a los clientes de todos los servidores.
+
+**4. El Auto Scaling repara solo:** termina una instancia desde la consola (**EC2 → Instancias → Terminar**). En unos minutos el ASG lanza otra para volver al número deseado, y el sitio sigue respondiendo con las demás.
 
 ---
 
@@ -432,14 +509,18 @@ Desde `ansible/` (salvo que se indique):
 
 | Quiero… | Comando |
 |---|---|
-| Desplegar una nueva versión de la API | `git push` en la rama configurada y luego `ansible-playbook deploy.yml --tags app` |
-| Forzar reconstrucción aunque no haya cambios | `ansible-playbook deploy.yml --tags app -e force_deploy=true` |
-| Actualizar un solo servidor | `ansible-playbook deploy.yml --limit sysranchito-dev-ec2-1` |
-| Ver logs de los 3 servidores | `ansible webservers -b -m shell -a "docker logs --tail 50 NOMBRE_CONTENEDOR"` |
-| Probar conexión a los servidores | `ansible webservers -m ping` |
-| Entrar por SSH a un servidor | `ssh -i ~/.ssh/TU_LLAVE.pem ubuntu@IP_DEL_SERVIDOR` (IPs en `inventory.ini`) |
-| Ver el estado de los servidores en el ALB | `aws elbv2 describe-target-health --target-group-arn $(aws elbv2 describe-target-groups --names sysranchito-dev-tg --query 'TargetGroups[0].TargetGroupArn' --output text) --output table` |
+| Desplegar una nueva versión de la API | `git push` en la rama configurada y luego `ansible-playbook deploy.yml` |
+| Cambiar variables del `.env` | Edita `app_extra_env` en `terraform.tfvars`, ejecuta `terraform apply` (en la raíz) y luego `ansible-playbook deploy.yml` |
+| Ver las instancias vivas | `./inventory.py --list` |
+| Actualizar una sola instancia | `ansible-playbook deploy.yml --limit i-0123456789abcdef0` |
+| Ver logs de todas las instancias | `ansible webservers -b -m shell -a "docker logs --tail 50 NOMBRE_CONTENEDOR"` |
+| Ver el log del bootstrap | `ansible webservers -b -m shell -a "tail -30 /var/log/sysbar-bootstrap.log"` |
+| Entrar a una instancia | `ssh -i ~/.ssh/TU_LLAVE.pem ubuntu@IP` (IPs en `./inventory.py --list`) o **Session Manager** desde la consola de EC2 (botón *Conectar*) |
+| Fijar el número de instancias | `aws autoscaling set-desired-capacity --auto-scaling-group-name sysranchito-dev-asg --desired-capacity 5` |
+| Reemplazar todas las instancias por nuevas | `aws autoscaling start-instance-refresh --auto-scaling-group-name sysranchito-dev-asg` |
 | Renovar sesión de AWS (SSO) | `aws sso login --profile TU_PERFIL_AWS` |
+
+> **¿`deploy.yml` o instance refresh?** `deploy.yml` actualiza en el lugar las instancias que ya existen, en ~5 min por instancia. Las instancias **nuevas** que cree el ASG después siempre clonan la punta de la rama, así que quedan con la misma versión. Si cambias el bootstrap, la AMI o el tipo de instancia, `terraform apply` lanza un **instance refresh** automático: crea instancias nuevas primero y luego retira las viejas.
 
 ### Renovar el certificado (cada ~60 días)
 
@@ -460,17 +541,18 @@ Mientras está encendido, la infraestructura cobra por hora. Para un entorno de 
 terraform destroy    # escribe: yes  (≈ 10 min)
 ```
 
-- Se borra todo lo que cobra (EC2, NLB, ALB, IP elástica, Redis, RDS). **Los datos de la base de datos se pierden.**
-- Se conservan en tu computadora: el código, tus `terraform.tfvars` / `vars.yml` y el certificado (`certs/`).
+- Se borra todo lo que cobra: instancias del ASG, NLB, ALB, IP elástica, Redis, RDS y parámetros de SSM. **Los datos de la base de datos se pierden.**
+- Se conservan en tu computadora: el código, tus `terraform.tfvars` / `vars.yml`, la deploy key y el certificado (`certs/`).
 
-Para volver a encenderla (≈ 25 min, sin copiar nada a mano):
+Para volver a encenderla (≈ 20 min, sin copiar nada a mano):
 
 ```bash
 terraform apply
 cd ansible
 ansible-playbook duckdns.yml     # la IP elástica será otra; esto la actualiza en DuckDNS
-ansible-playbook deploy.yml
 ```
+
+Las instancias se configuran solas. Si quieres esperar a que estén listas y comprobar el sitio, ejecuta `ansible-playbook deploy.yml`.
 
 ---
 
@@ -482,12 +564,15 @@ ansible-playbook deploy.yml
 | `Token has expired and refresh failed` | La sesión SSO venció (dura horas) | `aws sso login --profile TU_PERFIL_AWS` |
 | `Error: No configuration files` | Ejecutaste Terraform dentro de `ansible/` | `cd ..` a la raíz del repo |
 | `InvalidKeyPair.NotFound` | El Key Pair no existe en esa región | Créalo en la región de `aws_region` |
+| `Invalid function argument ... no file exists` en `ssm.tf` | No existe la deploy key en `github_deploy_key_path` | Genera la llave (ver [Deploy key](#deploy-key-de-github-repo-privado)) o pon `""` si el repo es público |
 | Error de RDS sobre la contraseña | Carácter no permitido | Usa solo letras, números y símbolos distintos de `@ / "` y espacio |
 | `Configura duckdns_token...` en `certificado.yml` | `vars.yml` aún tiene el valor de ejemplo | Pon tu token real de DuckDNS |
+| `No hay instancias en el grupo webservers` | Inventario dinámico vacío | Sesión de AWS activa (`aws sso login`), `terraform apply` completo y `./inventory.py --list` |
 | Ansible: `UNREACHABLE` / `timed out` | Tu IP pública cambió y el firewall no te deja entrar por SSH | `curl -4 ifconfig.me`, actualiza `ssh_allowed_cidrs` y `terraform apply` |
+| Las instancias se reemplazan una y otra vez | El bootstrap falla o `/api/health` no responde 200 | `ansible webservers -b -m shell -a "tail -50 /var/log/sysbar-bootstrap.log"` |
+| Log del bootstrap: `Permission denied (publickey)` en `git clone` | La deploy key no está agregada en GitHub o es de otro repo | Agrega `secrets/github_deploy_key.pub` en **Settings → Deploy keys** del repo de la API |
+| El sitio responde `502` / `503` justo después del `apply` | Las instancias aún construyen la API (~10 min) | Espera; `ansible-playbook deploy.yml` espera por ti y verifica |
 | `curl ifconfig.me` devuelve algo como `2806:...` | Es tu IPv6 | Usa `curl -4 ifconfig.me` |
-| Ansible se queda mucho tiempo en un paso | El servidor (1 GB RAM) está ocupado construyendo | Espera; si pasan >15 min sin avance, `Ctrl+C` y vuelve a ejecutar (es seguro repetirlo) |
-| El sitio responde `502` / `503` | La API no está corriendo o no responde el health check | `ansible webservers -b -m shell -a "docker ps -a; docker logs --tail 30 NOMBRE_CONTENEDOR"` |
 | `terraform destroy` falla con `ResourceInUse` en un listener | AWS aún no suelta el ALB del NLB | Espera 2–5 min y vuelve a ejecutar `terraform destroy` |
 | VS Code marca en rojo una variable de `terraform.tfvars` que sí existe | El editor guardó una versión vieja de `variables.tf` | Cierra pestañas sin guardar y, si VS Code avisa que el archivo cambió en disco, elige **Revert** |
 | `compdef: command not found` al abrir la terminal | Detalle de tu `~/.zshrc`, no del proyecto | Puedes ignorarlo |
@@ -496,37 +581,43 @@ ansible-playbook deploy.yml
 
 ## 💰 Costos
 
-Aproximados en `us-east-1`, con la configuración por defecto, **mientras está encendido**:
+Aproximados en `us-east-1`, precios de lista bajo demanda, **mientras está encendido**. Con Auto Scaling, el costo depende de cuántas instancias haya:
 
-| Recurso | ~USD/mes |
-|---|---|
-| 3 × EC2 `t3.micro` | 23 |
-| ALB | 17 |
-| NLB | 17 |
-| ElastiCache `cache.t4g.micro` | 12 |
-| RDS `db.t4g.micro` (20 GB) | 15 |
-| IPs públicas (1 elástica + 3 de las EC2) | 15 |
-| **Total aproximado** | **≈ 95–100** |
+| Recurso | Precio | 1 instancia (mín) | 3 instancias (normal) | 10 instancias (máx) |
+|---|---|---|---|---|
+| EC2 `t3.micro` | $0.0104/h c/u | $7.59 | $22.78 | $75.92 |
+| IP pública por instancia | $0.005/h c/u | $3.65 | $10.95 | $36.50 |
+| Disco gp3 16 GB por instancia | $0.08/GB-mes | $1.28 | $3.84 | $12.80 |
+| ALB | $0.0225/h + LCU | $16.43 | $16.43 | $16.43 + LCU |
+| NLB + su IP elástica | $0.0225/h + $0.005/h | $20.08 | $20.08 | $20.08 + NLCU |
+| ElastiCache `cache.t4g.micro` | $0.016/h | $11.68 | $11.68 | $11.68 |
+| RDS `db.t4g.micro` + 20 GB | $0.016/h + $0.115/GB-mes | $13.98 | $13.98 | $13.98 |
+| **Total aproximado / mes** | | **≈ $75** | **≈ $100** | **≈ $187** |
 
-Para pruebas: `terraform destroy` al terminar y `terraform apply` cuando lo necesites.
+- El ASG solo llega a 10 instancias con tráfico alto sostenido. Con poco tráfico baja hasta 1 y el costo baja a ≈ $75 al mes.
+- No incluye LCU/NLCU ni transferencia de salida; con tráfico bajo suman pocos dólares.
+- Para pruebas: `terraform destroy` al terminar y `terraform apply` cuando lo necesites.
 
 ---
 
 ## 🔒 Seguridad
 
-- **Nada sensible se sube a git:** tokens, contraseñas, IPs, certificados y el estado de Terraform están en `.gitignore`. Solo se suben las plantillas `.example`.
-- **Solo el NLB es público.** El ALB es interno; las EC2 aceptan HTTP **solo desde el ALB** y SSH **solo desde `ssh_allowed_cidrs`**; RDS y Redis aceptan conexiones **solo desde las EC2**.
-- La API se publica en `127.0.0.1` dentro de cada servidor: solo Nginx puede llegar a ella.
-- TLS 1.2/1.3 en el ALB (`ELBSecurityPolicy-TLS13-1-2-2021-06`) y redirección automática de HTTP → HTTPS.
+- **Nada sensible se sube a git:** tokens, contraseñas, deploy key, certificados y el estado de Terraform están en `.gitignore`. Solo se suben las plantillas `.example`.
+- **Secretos cifrados en SSM:** el `.env` y la deploy key se guardan como `SecureString`. No viajan en el `user_data` ni quedan en la plantilla de lanzamiento.
+- **Permisos mínimos:** el rol de las instancias solo puede **leer** los parámetros `/<proyecto>-<entorno>/app/*` y usar Session Manager.
+- **Deploy key de solo lectura** y limitada a un solo repositorio.
+- **Solo el NLB es público.** El ALB es interno; las instancias aceptan HTTP **solo desde el ALB** y SSH **solo desde `ssh_allowed_cidrs`**; RDS y Redis aceptan conexiones **solo desde las instancias**.
+- La API se publica en `127.0.0.1` dentro de cada instancia: solo Nginx puede llegar a ella.
+- Discos cifrados, IMDSv2 obligatorio, TLS 1.2/1.3 en el ALB y redirección automática de HTTP a HTTPS.
 - Fail2ban bloquea intentos repetidos de SSH; UFW solo abre los puertos 22 y 80.
-- `terraform.tfstate` contiene la llave privada del certificado y la contraseña de la BD: **no lo compartas**. Para equipos, muévelo a un backend S3 cifrado.
+- `terraform.tfstate` contiene secretos (llave del certificado, contraseña de la BD, `.env`): **no lo compartas**. Para equipos, muévelo a un backend S3 cifrado.
 
 ---
 
 ## 🧭 Limitaciones y mejoras futuras
 
-- **NLB en una sola zona** (para tener una sola IP): si esa zona de AWS falla, el sitio cae. Es el costo de usar DuckDNS con una IP fija. Con un dominio propio en Route 53 se puede usar solo el ALB en varias zonas, con un certificado de ACM gratuito y renovación automática.
+- **Arranque lento (~10 min por instancia):** cada instancia construye la imagen de Docker. Mejora: construir la imagen una vez en GitHub Actions, subirla a **ECR** y que las instancias solo la descarguen (arranque en ~2 min).
+- **NLB en una sola zona** (para tener una sola IP): si esa zona de AWS falla, el sitio cae. Es el costo de usar DuckDNS con una IP fija. Con un dominio propio en Route 53 se puede usar solo el ALB en varias zonas, con certificado ACM gratuito y renovación automática.
 - **El certificado se renueva manualmente** cada ~60 días.
-- **Cada servidor construye la imagen** (~5 min en `t3.micro`). Mejora: construirla una vez en GitHub Actions, subirla a ECR y que los servidores solo la descarguen.
-- **Instancias fijas.** Mejora: Auto Scaling Group para reemplazar servidores caídos automáticamente.
-- **`synchronize: true` en TypeORM** (si tu API lo usa): conviene pasar a migraciones antes de tener datos reales. El playbook ya soporta ejecutarlas una sola vez con `app_migration_command`.
+- **IP pública por instancia** (para salida a internet y SSH). Mejora: subnets privadas con NAT o endpoints de VPC y acceso solo por Session Manager.
+- **`synchronize: true` en TypeORM** (si tu API lo usa): con varias instancias arrancando a la vez, conviene pasar a migraciones antes de tener datos reales.
