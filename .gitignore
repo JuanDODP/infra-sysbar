@@ -53,3 +53,8 @@ ansible/group_vars/all/infra.yml
 # Dependencias del script de prueba de WebSockets
 scripts/node_modules/
 scripts/package-lock.json
+
+# Auto Scaling Group: configuración del inventario dinámico (generada por Terraform)
+ansible/.aws_inventory.json
+# Deploy keys y otros secretos locales
+secrets/
