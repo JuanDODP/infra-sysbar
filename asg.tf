@@ -159,6 +159,14 @@ resource "aws_autoscaling_policy" "cpu" {
   }
 }
 
+# AWS tarda unos segundos en reconocer que el target group pertenece al ASG; si la
+# política de peticiones se crea antes, responde "Provided Target Groups may not be valid".
+resource "time_sleep" "wait_asg_target_group" {
+  create_duration = "30s"
+
+  depends_on = [aws_autoscaling_group.app, aws_lb_listener.https]
+}
+
 resource "aws_autoscaling_policy" "requests" {
   name                   = "${local.name_prefix}-requests-target"
   autoscaling_group_name = aws_autoscaling_group.app.name
@@ -172,6 +180,6 @@ resource "aws_autoscaling_policy" "requests" {
     target_value = var.scaling_requests_per_target
   }
 
-  # El target group debe estar asociado a un listener del ALB
-  depends_on = [aws_lb_listener.https]
+  # El target group debe estar asociado al ASG y a un listener del ALB
+  depends_on = [time_sleep.wait_asg_target_group]
 }
