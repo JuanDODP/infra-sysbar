@@ -1,235 +1,88 @@
 ---
-# PASO 4 (después de duckdns.yml).
-# Configura las 3 EC2 por igual y, si definiste app_repo_url, despliega la app
-# servidor por servidor (rolling) para no tirar el servicio.
+# Despliegue de una NUEVA VERSIÓN de la API en las instancias que estén corriendo.
+#
+# Las instancias del Auto Scaling Group se configuran y despliegan SOLAS al arrancar
+# (templates/user_data.sh.tftpl). Este playbook solo hace falta cuando subes cambios
+# a la rama configurada (app_repo_version) o cambias el .env (app_extra_env + terraform apply).
+#
+# Ejecuta en cada instancia, una por una (rolling), el mismo script del bootstrap:
+#   /usr/local/bin/app-deploy  ->  git pull + .env desde SSM + docker compose up --build
 #
 # Uso:                 ansible-playbook deploy.yml
-# Solo la app:         ansible-playbook deploy.yml --tags app
-# Un solo servidor:    ansible-playbook deploy.yml --limit sysranchito-dev-ec2-1
+# Un solo servidor:    ansible-playbook deploy.yml --limit i-0123456789abcdef0
+# Ver instancias:      ./inventory.py --list
 
 # ==========================================================
-# PLAY 1: Preparar los servidores (en paralelo)
+# PLAY 0: Comprobar que hay instancias en el Auto Scaling Group
 # ==========================================================
-- name: Preparar servidores EC2 para SysRanchito
-  hosts: webservers
-  become: true
-  vars_files:
-    - vars.yml
-  tags: [setup]
+- name: Comprobar inventario dinámico
+  hosts: localhost
+  connection: local
+  gather_facts: false
 
   tasks:
-    - name: Actualizar repositorios e instalar paquetes base
-      apt:
-        update_cache: true
-        cache_valid_time: 3600
-        name:
-          - curl
-          - git
-          - ufw
-          - fail2ban
-          - nginx
-        state: present
-
-    # --- 0. SWAP: t3.micro tiene 1 GB de RAM y `docker build` (npm ci + nest build) lo rebasa ---
-    - name: Crear swap de 2 GB
-      shell: fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile
-      args:
-        creates: /swapfile
-
-    - name: Activar swap al reiniciar
-      lineinfile:
-        path: /etc/fstab
-        line: "/swapfile none swap sw 0 0"
-
-    # --- 1. INSTALACIÓN DE DOCKER & DOCKER COMPOSE ---
-    - name: Descargar script oficial de Docker
-      get_url:
-        url: https://get.docker.com
-        dest: /tmp/get-docker.sh
-        mode: "0755"
-
-    - name: Ejecutar script de instalación de Docker
-      command: sh /tmp/get-docker.sh
-      args:
-        creates: /usr/bin/docker
-
-    - name: Asegurar que Docker esté activo
-      systemd:
-        name: docker
-        state: started
-        enabled: true
-
-    - name: Agregar usuario ubuntu al grupo docker
-      user:
-        name: ubuntu
-        groups: docker
-        append: true
-
-    # --- 2. CONFIGURACIÓN DE SEGURIDAD (FAIL2BAN & FIREWALL) ---
-    - name: Configurar jaula básica de Fail2ban para SSH
-      copy:
-        dest: /etc/fail2ban/jail.local
-        content: |
-          [DEFAULT]
-          bantime  = 1h
-          findtime = 10m
-          maxretry = 5
-
-          [sshd]
-          enabled = true
-          port    = ssh
-      notify: Reiniciar Fail2ban
-
-    - name: Asegurar que Fail2ban esté activo
-      systemd:
-        name: fail2ban
-        state: started
-        enabled: true
-
-    # Solo SSH y HTTP: el TLS termina en el ALB, las EC2 ya no exponen 443 ni 3000
-    - name: Configurar reglas de UFW (Firewall)
-      ufw:
-        rule: allow
-        port: "{{ item }}"
-        proto: tcp
-      loop:
-        - "22" # SSH
-        - "80" # HTTP desde el ALB
-
-    - name: Habilitar UFW
-      ufw:
-        state: enabled
-
-    # --- 3. PREPARAR DIRECTORIOS ---
-    - name: Asegurar que el directorio de la app tenga permisos para ubuntu
-      file:
-        path: "{{ app_directory }}"
-        state: directory
-        owner: ubuntu
-        group: ubuntu
-        mode: "0755"
-
-    # --- 4. LIMPIAR CONFIGURACIÓN DE UN SOLO SERVIDOR (Certbot) ---
-    # El certificado ahora vive en el ALB. Si la EC2 tenía Certbot de la versión
-    # anterior, se elimina su renovación automática para que no falle.
-    - name: Quitar Certbot (el TLS ahora lo maneja el ALB)
-      apt:
-        name:
-          - certbot
-          - python3-certbot-nginx
-        state: absent
-
-    # --- 5. CONFIGURAR NGINX (HTTP + WebSockets detrás del ALB) ---
-    - name: Crear configuración de Nginx desde plantilla jinja2
-      template:
-        src: nginx.conf.j2
-        dest: /etc/nginx/sites-available/sysranchito.conf
-        mode: "0644"
-      notify: Recargar Nginx
-
-    - name: Habilitar sitio en Nginx
-      file:
-        src: /etc/nginx/sites-available/sysranchito.conf
-        dest: /etc/nginx/sites-enabled/sysranchito.conf
-        state: link
-      notify: Recargar Nginx
-
-    - name: Remover sitio default de Nginx
-      file:
-        path: /etc/nginx/sites-enabled/default
-        state: absent
-      notify: Recargar Nginx
-
-    - name: Asegurar que Nginx esté activo
-      systemd:
-        name: nginx
-        state: started
-        enabled: true
-
-  handlers:
-    - name: Reiniciar Fail2ban
-      systemd:
-        name: fail2ban
-        state: restarted
-
-    - name: Recargar Nginx
-      shell: nginx -t && systemctl reload nginx
+    - name: Debe haber al menos una instancia corriendo
+      assert:
+        that: groups['webservers'] | default([]) | length > 0
+        fail_msg: >-
+          No hay instancias en el grupo webservers. Revisa que `terraform apply` haya terminado,
+          que tu sesión de AWS esté activa (aws sso login --profile PERFIL) y prueba ./inventory.py --list
+        success_msg: "Instancias encontradas: {{ groups['webservers'] | join(', ') }}"
 
 # ==========================================================
-# PLAY 2: Desplegar la app (rolling, 1 servidor a la vez)
+# PLAY 1: Desplegar (rolling, una instancia a la vez)
 # ==========================================================
-- name: Desplegar aplicación NestJS
+- name: Desplegar la API en las instancias del Auto Scaling Group
   hosts: webservers
   become: true
+  gather_facts: false
   serial: "{{ deploy_serial | default(1) }}"
-  vars_files:
-    - vars.yml
-  tags: [app]
 
   tasks:
-    - name: Saltar despliegue si no hay repositorio configurado
-      meta: end_host
-      when: app_repo_url | default('') | length == 0
+    # Una instancia recién creada puede seguir ejecutando su bootstrap
+    - name: Esperar a que termine el bootstrap (cloud-init)
+      command: cloud-init status --wait
+      changed_when: false
+      failed_when: false
 
-    - name: Clonar/actualizar repositorio de la app
-      become: false # como ubuntu, para usar tu llave de GitHub (ForwardAgent)
-      git:
-        repo: "{{ app_repo_url }}"
-        dest: "{{ app_directory }}/{{ app_name }}"
-        version: "{{ app_repo_version }}"
-        accept_newhostkey: true
-        force: true
-      register: app_repo
+    - name: Verificar que el bootstrap dejó instalado app-deploy
+      stat:
+        path: /usr/local/bin/app-deploy
+      register: deploy_script
 
-    - name: Generar .env de la app
-      template:
-        src: app.env.j2
-        dest: "{{ app_directory }}/{{ app_name }}/.env"
-        owner: ubuntu
-        group: ubuntu
-        mode: "0600"
-      register: app_env_file
+    - name: Fallar con un mensaje claro si el bootstrap no terminó bien
+      fail:
+        msg: "El bootstrap falló en {{ inventory_hostname }}. Revisa: sudo tail -100 /var/log/sysbar-bootstrap.log"
+      when: not deploy_script.stat.exists
 
-    # async/poll: el build corre en segundo plano en el servidor y Ansible lo revisa
-    # cada 15 s, así no depende de mantener abierta una sola conexión SSH por 5+ minutos.
-    - name: Construir y levantar contenedores (tarda ~5 min en t3.micro)
-      command: >-
-        docker compose -f {{ app_compose_file }} up -d --build --remove-orphans
-      args:
-        chdir: "{{ app_directory }}/{{ app_name }}"
+    # async/poll: el build corre en segundo plano y Ansible lo revisa cada 15 s
+    - name: Ejecutar app-deploy (git pull + .env + docker compose up --build)
+      command: /usr/local/bin/app-deploy
       async: 1800
       poll: 15
-      when: app_repo.changed or app_env_file.changed or (force_deploy | default(false) | bool)
+      register: deploy_out
 
-    - name: Esperar a que la app escuche en el puerto {{ app_port }}
+    - name: Resultado del despliegue
+      debug:
+        msg: "{{ deploy_out.stdout_lines | default([]) | last | default('ok') }}"
+
+    - name: Esperar a que la API escuche en el puerto {{ app_port }}
       wait_for:
         host: 127.0.0.1
         port: "{{ app_port }}"
-        timeout: 180
+        timeout: 300
 
-    # Solo en el primer servidor, antes de actualizar los demás
-    - name: Ejecutar migraciones (una sola vez)
-      command: >-
-        docker compose -f {{ app_compose_file }} exec -T {{ app_service }}
-        sh -c "{{ app_migration_command }}"
-      args:
-        chdir: "{{ app_directory }}/{{ app_name }}"
-      when:
-        - app_migration_command | default('') | length > 0
-        - inventory_hostname == groups['webservers'][0]
-        - app_repo.changed or (force_deploy | default(false) | bool)
-
-    - name: Verificar que Nginx -> app responde (igual que el health check del ALB)
+    - name: Verificar Nginx -> API (igual que el health check del ALB)
       uri:
-        url: "http://127.0.0.1{{ health_check_path | default('/') }}"
-        status_code: "{{ range(200, 500) | list }}"
+        url: "http://127.0.0.1{{ health_check_path }}"
+        status_code: 200
       register: health
-      until: health.status is defined and health.status < 500
-      retries: 12
+      until: health.status == 200
+      retries: 24
       delay: 5
 
 # ==========================================================
-# PLAY 3: Comprobación final a través del dominio público
+# PLAY 2: Comprobación final a través del dominio público
 # ==========================================================
 - name: Verificar el sitio público
   hosts: localhost
@@ -237,23 +90,18 @@
   gather_facts: false
   vars_files:
     - vars.yml
-  tags: [app, check]
 
   tasks:
-    - name: Saltar verificación si la app no se despliega con Ansible
-      meta: end_play
-      when: app_repo_url | default('') | length == 0
-
-    - name: Probar https://{{ domain_name }}
+    - name: Probar https://{{ domain_name }}{{ health_check_path }}
       uri:
-        url: "https://{{ domain_name }}{{ health_check_path | default('/') }}"
-        status_code: "{{ range(200, 500) | list }}"
+        url: "https://{{ domain_name }}{{ health_check_path }}"
+        status_code: 200
         validate_certs: true
       register: public_check
-      until: public_check.status is defined and public_check.status < 500
+      until: public_check.status == 200
       retries: 10
       delay: 15
 
     - name: Resultado
       debug:
-        msg: "https://{{ domain_name }} respondió {{ public_check.status }} a través de NLB -> ALB -> EC2"
+        msg: "https://{{ domain_name }} respondió {{ public_check.status }} a través de NLB -> ALB -> ASG"
