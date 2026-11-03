@@ -88,6 +88,11 @@ resource "aws_autoscaling_group" "app" {
   # No bloquear `terraform apply` mientras las instancias construyen la imagen (~8 min)
   wait_for_capacity_timeout = "0"
 
+  # Al destruir: terminar las instancias sin esperar a que el grupo se vacíe poco a poco.
+  # Evita que el ASG quede "eliminándose" en AWS después de `terraform destroy`
+  # (error AlreadyExists en el siguiente apply).
+  force_delete = true
+
   # Al cambiar el launch template (AMI, tamaño, bootstrap...) reemplaza las instancias
   # sin cortar el servicio: primero lanza las nuevas y luego retira las viejas.
   instance_refresh {
